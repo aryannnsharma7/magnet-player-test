@@ -18,6 +18,15 @@ const volumeBar = $('volumeBar');
 const fullscreenBtn = $('fullscreenBtn');
 
 const SINTEL_MAGNET = 'magnet:?xt=urn:btih:08ada5a7a6183aae1e09d831df6748d566095a10&dn=Sintel&tr=udp%3A%2F%2Fexplodie.org%3A6969&tr=udp%3A%2F%2Ftracker.coppersurfer.tk%3A6969&tr=udp%3A%2F%2Ftracker.empire-js.us%3A1337&tr=udp%3A%2F%2Ftracker.leechers-paradise.org%3A1337&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337&tr=wss%3A%2F%2Ftracker.btorrent.xyz&tr=wss%3A%2F%2Ftracker.fastcast.nz&tr=wss%3A%2F%2Ftracker.openwebtorrent.com&ws=https%3A%2F%2Fwebtorrent.io%2Ftorrents%2F&xs=https%3A%2F%2Fwebtorrent.io%2Ftorrents%2Fsintel.torrent';
+
+// Browser WebTorrent peers need WebRTC-capable (WebSocket-tracker) discovery.
+// These trackers improve discovery when a swarm has browser-capable peers; they
+// cannot make a UDP/TCP-only swarm compatible with a browser.
+const BROWSER_TRACKERS = [
+  'wss://tracker.openwebtorrent.com',
+  'wss://tracker.btorrent.xyz',
+  'wss://tracker.fastcast.nz'
+];
 const MEDIA_EXTENSIONS = /\.(mp4|m4v|mkv|webm|mov|ogv|ogg|mp3|m4a|wav|flac|aac|opus|3gp|3g2)$/i;
 const AUDIO_EXTENSIONS = /\.(mp3|m4a|wav|flac|aac|opus|ogg)$/i;
 
@@ -27,11 +36,32 @@ let activeTorrent = null;
 let selectedFile = null;
 let serverCreated = false;
 let statsTimer = null;
+let noPeerTimer = null;
 let scrubbing = false;
 
 function setStatus(message, kind = 'idle') {
   statusText.textContent = message;
   statusBox.dataset.kind = kind;
+}
+
+function prepareBrowserMagnet(magnet) {
+  const existing = new Set();
+  for (const match of magnet.matchAll(/[?&]tr=([^&]+)/gi)) {
+    try {
+      existing.add(decodeURIComponent(match[1].replace(/\+/g, ' ')).replace(/\/+$/, '').toLowerCase());
+    } catch (_) {
+      existing.add(match[1].toLowerCase());
+    }
+  }
+
+  const added = BROWSER_TRACKERS.filter((tracker) => !existing.has(tracker.replace(/\/+$/, '').toLowerCase()));
+  if (!added.length) return { uri: magnet, added };
+  const fragmentIndex = magnet.indexOf('#');
+  const base = fragmentIndex >= 0 ? magnet.slice(0, fragmentIndex) : magnet;
+  const fragment = fragmentIndex >= 0 ? magnet.slice(fragmentIndex) : '';
+  const separator = base.includes('?') ? '&' : '?';
+  const extra = added.map((tracker) => `tr=${encodeURIComponent(tracker)}`).join('&');
+  return { uri: `${base}${separator}${extra}${fragment}`, added };
 }
 
 function prettyBytes(value) {
@@ -202,7 +232,28 @@ function attachTorrent(torrent) {
   $('playerSubtitle').textContent = 'Looking up torrent metadata and peers…';
   setStatus('Magnet accepted. Looking for metadata and compatible peers…', 'working');
   torrent.on('error', (error) => setStatus(`Torrent error: ${error.message || error}`, 'error'));
-  torrent.on('warning', (warning) => setStatus(`Torrent warning: ${warning.message || warning}`, 'working'));
+  torrent.on('warning', (warning) => {
+    const message = warning.message || String(warning);
+    if (/unsupported tracker protocol/i.test(message)) {
+      setStatus('A tracker uses a protocol the browser cannot use directly (commonly UDP). That warning is not automatically fatal. WebSocket trackers were added; playback still requires WebRTC-capable peers or a reachable web seed.', 'working');
+    } else {
+      setStatus(`Tracker warning: ${message}`, 'working');
+    }
+  });
+
+  armNoPeerTimeout(torrent);
+
+  torrent.on('wire', () => {
+    clearTimeout(noPeerTimer);
+    noPeerTimer = null;
+    if (statusBox.dataset.kind === 'error' && /No browser-compatible peers/.test(statusText.textContent)) {
+      setStatus('A WebRTC peer connected. Waiting for torrent data…', 'working');
+    }
+  });
+  torrent.on('download', () => {
+    clearTimeout(noPeerTimer);
+    noPeerTimer = null;
+  });
 
   const onReady = () => {
     if (activeTorrent !== torrent || readyRendered) return;
@@ -221,6 +272,11 @@ function attachTorrent(torrent) {
       const onlyButton = fileList.querySelector('.file-row');
       selectMediaFile(files[0], torrent, onlyButton);
     }
+    // Metadata can arrive from an .torrent URL before any WebRTC peer connects.
+    // Restart the timeout after metadata discovery so the UI doesn't stay optimistic.
+    if ((Number(torrent.numPeers) || 0) === 0 && (Number(torrent.downloaded) || 0) === 0) {
+      armNoPeerTimeout(torrent);
+    }
   };
 
   torrent.on('ready', onReady);
@@ -228,6 +284,19 @@ function attachTorrent(torrent) {
   clearInterval(statsTimer);
   statsTimer = setInterval(updateStats, 800);
   updateStats();
+}
+
+function armNoPeerTimeout(torrent) {
+  clearTimeout(noPeerTimer);
+  noPeerTimer = setTimeout(() => {
+    if (activeTorrent !== torrent) return;
+    const peers = Number(torrent.numPeers) || 0;
+    const downloaded = Number(torrent.downloaded) || 0;
+    if (peers === 0 && downloaded === 0) {
+      $('playerBadge').textContent = torrent.ready ? 'NO PEERS' : 'NO METADATA';
+      setStatus('No browser-compatible peers or media data found after 30 seconds. This magnet may have only ordinary UDP/TCP peers. The browser cannot connect to those directly; it needs WebRTC-capable peers or a reachable web seed.', 'error');
+    }
+  }, 30000);
 }
 
 function updateStats() {
@@ -256,8 +325,13 @@ async function startMagnet(rawMagnet) {
     resetPlayer();
     resetStats();
     await ensureClient();
-    const torrent = client.add(magnet);
+    const prepared = prepareBrowserMagnet(magnet);
+    if (prepared.added.length) {
+      setStatus(`Added ${prepared.added.length} WebSocket tracker(s) for browser-compatible peer discovery. This helps only if the swarm has WebRTC peers or a web seed.`, 'working');
+    }
+    const torrent = client.add(prepared.uri);
     attachTorrent(torrent);
+
   } catch (error) {
     setStatus(error.message || String(error), 'error');
     startBtn.disabled = false;
@@ -268,6 +342,8 @@ async function startMagnet(rawMagnet) {
 
 async function stopTorrent(showMessage = true) {
   clearInterval(statsTimer);
+  clearTimeout(noPeerTimer);
+  noPeerTimer = null;
   statsTimer = null;
   const torrentToRemove = activeTorrent;
   activeTorrent = null;
@@ -368,6 +444,7 @@ try {
 
 window.addEventListener('pagehide', () => {
   clearInterval(statsTimer);
+  clearTimeout(noPeerTimer);
   if (client) {
     try { client.destroy(); } catch (_) {}
   }
